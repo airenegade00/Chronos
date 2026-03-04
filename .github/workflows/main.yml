@@ -22,8 +22,9 @@ jobs:
       - name: Android SDK beallitasa
         uses: android-actions/setup-android@v3
 
-      - name: gradle-wrapper.jar letoltese
+      -  name: gradle-wrapper.jar letoltese
         run: |
+          mkdir -p android/gradle/wrapper
           curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
             https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar
 
