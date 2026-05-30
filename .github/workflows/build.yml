@@ -25,7 +25,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
       - name: Install dependencies & sync Capacitor
         working-directory: chronos
@@ -34,13 +34,13 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Patch build.gradle – add biometric dependency
+      - name: Patch build.gradle â add biometric dependency
         working-directory: chronos
         run: |
           GRADLE="android/app/build.gradle"
           sed -i 's|dependencies {|dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"|' "$GRADLE"
 
-      - name: Patch AndroidManifest – biometric permissions
+      - name: Patch AndroidManifest â biometric permissions
         working-directory: chronos
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
