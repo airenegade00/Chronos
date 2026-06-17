@@ -34,17 +34,31 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Patch build.gradle – add biometric dependency
+      - name: Patch build.gradle – add biometric & core dependencies
         working-directory: chronos
         run: |
           GRADLE="android/app/build.gradle"
-          sed -i 's|dependencies {|dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"|' "$GRADLE"
+          sed -i 's|dependencies {|dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"\n    implementation "androidx.core:core:1.10.0"|' "$GRADLE"
 
       - name: Patch AndroidManifest – biometric permissions
         working-directory: chronos
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           sed -i 's|</manifest>|    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n    <uses-permission android:name="android.permission.USE_FINGERPRINT" />\n</manifest>|' "$MANIFEST"
+
+      - name: Add FileProvider (needed for AndroidBridge.shareFile)
+        working-directory: chronos
+        run: |
+          RES_DIR="android/app/src/main/res"
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          # 1. file_paths.xml létrehozása
+          mkdir -p "${RES_DIR}/xml"
+          cp android-res/xml/file_paths.xml "${RES_DIR}/xml/file_paths.xml"
+
+          # 2. <provider> beillesztése a záró </application> elé
+          PROVIDER='    <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true"><meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" /></provider>'
+          sed -i "s|</application>|${PROVIDER}\n</application>|" "$MANIFEST"
 
       - name: Inject custom MainActivity (biometric bridge)
         working-directory: chronos
