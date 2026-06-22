@@ -38,7 +38,7 @@ jobs:
         working-directory: chronos
         run: |
           GRADLE="android/app/build.gradle"
-          sed -i 's|dependencies {|dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"\n    implementation "androidx.core:core:1.10.0"\n    implementation "androidx.activity:activity:1.8.0"|' "$GRADLE"
+          sed -i 's|dependencies {|dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"\n    implementation "androidx.core:core:1.10.0"\n    implementation "androidx.activity:activity:1.8.0"\n    implementation "com.google.android.gms:play-services-auth:21.2.0"|' "$GRADLE"
 
       - name: Patch AndroidManifest – biometric permissions
         working-directory: chronos
@@ -99,3 +99,4 @@ jobs:
           name: chronos-apk
           path: chronos/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
+ 
