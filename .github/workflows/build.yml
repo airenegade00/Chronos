@@ -1,8 +1,12 @@
 name: Build Chronos APK
 
 # Repo secretek (Settings → Secrets and variables → Actions):
+#   KEYSTORE_PASSPHRASE      bármilyen HOSSZÚ véletlen szöveg (20+ karakter) – ezzel titkosítjuk az aláíró kulcsot
 #   GOOGLE_SERVICES_JSON     a Firebase-ből letöltött google-services.json TELJES tartalma
-#   DEBUG_KEYSTORE_BASE64    fix aláíró kulcs (egyszer generáld: Run workflow → create_keystore = igen)
+#
+# Fix aláíró kulcs: a workflow egyszer legenerálja (Run workflow → create_keystore),
+# TITKOSÍTVA elmenti a repóba (debug.keystore.enc), és minden build ezt használja.
+# (Publikus repónál is biztonságos: jelszó nélkül a fájl használhatatlan.)
 #
 # Miért kell a fix kulcs: a GitHub runner minden buildnél ÚJ debug kulcsot generál →
 # minden APK más SHA-1-gyel készül, így a Google belépés nem működhet, és az APK
@@ -22,36 +26,49 @@ jobs:
   keystore:
     if: ${{ github.event.inputs.create_keystore == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Generate keystore
+      - name: Generate + encrypt keystore
+        env:
+          PASSPHRASE: ${{ secrets.KEYSTORE_PASSPHRASE }}
         run: |
+          if [ -f debug.keystore.enc ]; then
+            echo "::error::Már van debug.keystore.enc a repóban – nem írom felül (új kulccsal a telepített APK nem frissíthető, és a Firebase-ben lévő SHA-1 érvénytelen lenne). Ha tényleg újat akarsz, előbb töröld a fájlt a repóból."
+            exit 1
+          fi
+          if [ -z "$PASSPHRASE" ]; then
+            echo "::error::Hiányzik a KEYSTORE_PASSPHRASE repo secret"
+            exit 1
+          fi
           keytool -genkeypair -keystore debug.keystore \
             -alias androiddebugkey -storepass android -keypass android \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
-          base64 -w0 debug.keystore > DEBUG_KEYSTORE_BASE64.txt
           {
-            echo "### Új kulcs ujjlenyomatai → Firebase → Project settings → Android app (com.chronos.app) → SHA hozzáadása"
+            echo "### Az új kulcs ujjlenyomatai → Firebase → Project settings → Android app (com.chronos.app) → Add fingerprint (mindkettőt)"
             keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1|SHA256"
-            echo
-            echo "A **chronos-keystore-SECRET** artifact (1 napig) tartalmazza a kulcsot. A DEBUG_KEYSTORE_BASE64.txt tartalmát told be DEBUG_KEYSTORE_BASE64 repo secretnek, utána töröld az artifactot."
-            echo "**Őrizd meg a debug.keystore fájlt** – nélküle nem frissíthető az APK."
           } >> "$GITHUB_STEP_SUMMARY"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in debug.keystore -out debug.keystore.enc -pass env:PASSPHRASE
+          rm -f debug.keystore
 
-      - name: Upload keystore artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: chronos-keystore-SECRET
-          path: |
-            debug.keystore
-            DEBUG_KEYSTORE_BASE64.txt
-          retention-days: 1
+      - name: Commit encrypted keystore
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add debug.keystore.enc
+          git commit -m "Add encrypted signing keystore [skip ci]"
+          git push
 
   build:
     if: ${{ github.event.inputs.create_keystore != 'true' }}
@@ -195,13 +212,14 @@ jobs:
 
       - name: Use fixed signing key
         env:
-          KS: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+          PASSPHRASE: ${{ secrets.KEYSTORE_PASSPHRASE }}
         run: |
-          if [ -z "$KS" ]; then
-            echo "::warning::Nincs DEBUG_KEYSTORE_BASE64 secret → ez a build véletlen kulccsal íródik alá: a Google belépés nem fog működni, és az APK nem frissíthető a telepített felett. Futtasd egyszer a workflow-t create_keystore = igen beállítással."
-          else
+          if [ -f debug.keystore.enc ] && [ -n "$PASSPHRASE" ]; then
             mkdir -p ~/.android
-            echo "$KS" | base64 -d > ~/.android/debug.keystore
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in debug.keystore.enc -out ~/.android/debug.keystore -pass env:PASSPHRASE
+          else
+            echo "::warning::Nincs fix kulcs (debug.keystore.enc vagy KEYSTORE_PASSPHRASE hiányzik) → ez a build véletlen kulccsal íródik alá: a Google belépés nem fog működni, és az APK nem frissíthető a telepített felett. Futtasd egyszer a workflow-t create_keystore = igen beállítással."
           fi
 
       - name: Build APK
