@@ -1,12 +1,60 @@
 name: Build Chronos APK
 
+# Repo secretek (Settings → Secrets and variables → Actions):
+#   GOOGLE_SERVICES_JSON     a Firebase-ből letöltött google-services.json TELJES tartalma
+#   DEBUG_KEYSTORE_BASE64    fix aláíró kulcs (egyszer generáld: Run workflow → create_keystore = igen)
+#
+# Miért kell a fix kulcs: a GitHub runner minden buildnél ÚJ debug kulcsot generál →
+# minden APK más SHA-1-gyel készül, így a Google belépés nem működhet, és az APK
+# nem frissíthető a telepített felett. Fix kulccsal mindkettő megoldódik.
+
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      create_keystore:
+        description: 'Egyszeri: fix aláíró kulcs generálása (APK-t nem épít)'
+        type: boolean
+        default: false
 
 jobs:
+  keystore:
+    if: ${{ github.event.inputs.create_keystore == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Generate keystore
+        run: |
+          keytool -genkeypair -keystore debug.keystore \
+            -alias androiddebugkey -storepass android -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          base64 -w0 debug.keystore > DEBUG_KEYSTORE_BASE64.txt
+          {
+            echo "### Új kulcs ujjlenyomatai → Firebase → Project settings → Android app (com.chronos.app) → SHA hozzáadása"
+            keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1|SHA256"
+            echo
+            echo "A **chronos-keystore-SECRET** artifact (1 napig) tartalmazza a kulcsot. A DEBUG_KEYSTORE_BASE64.txt tartalmát told be DEBUG_KEYSTORE_BASE64 repo secretnek, utána töröld az artifactot."
+            echo "**Őrizd meg a debug.keystore fájlt** – nélküle nem frissíthető az APK."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload keystore artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronos-keystore-SECRET
+          path: |
+            debug.keystore
+            DEBUG_KEYSTORE_BASE64.txt
+          retention-days: 1
+
   build:
+    if: ${{ github.event.inputs.create_keystore != 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -34,6 +82,13 @@ jobs:
           npx cap add android
           npx cap sync android
 
+      - name: Check native Google sign-in plugin is included
+        working-directory: chronos
+        run: |
+          PJ="android/app/src/main/assets/capacitor.plugins.json"
+          cat "$PJ"
+          grep -q FirebaseAuthentication "$PJ" || { echo "::error::A FirebaseAuthentication plugin nem került be (a chronos-capacitor.zip package.json-jában benne van a @capacitor-firebase/authentication?)"; exit 1; }
+
       - name: Patch build.gradle – add biometric, core & activity dependencies
         working-directory: chronos
         run: |
@@ -44,7 +99,7 @@ jobs:
         working-directory: chronos
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-          sed -i 's|</manifest>|    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n    <uses-permission android:name="android.permission.USE_FINGERPRINT" />\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n</manifest>|' "$MANIFEST"
+          sed -i 's|</manifest>|    <uses-permission android:name="android.permission.USE_BIOMETRIC" />\n    <uses-permission android:name="android.permission.USE_FINGERPRINT" />\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <uses-permission android:name="android.permission.VIBRATE" />\n</manifest>|' "$MANIFEST"
 
       - name: Add FileProvider (needed for AndroidBridge.shareFile)
         working-directory: chronos
@@ -102,11 +157,66 @@ jobs:
           cp "${RES_DIR}/mipmap-anydpi-v26/ic_launcher.xml" \
              "${RES_DIR}/mipmap-anydpi-v26/ic_launcher_round.xml"
 
+      - name: Add google-services.json (Firebase / Google sign-in)
+        working-directory: chronos
+        env:
+          GSJ: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$GSJ" ]; then
+            echo "::error::Hiányzik a GOOGLE_SERVICES_JSON repo secret (Firebase → Project settings → google-services.json tartalma)"
+            exit 1
+          fi
+          printf '%s' "$GSJ" > android/app/google-services.json
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          d = json.load(open('android/app/google-services.json'))
+          pk = [c['client_info']['android_client_info']['package_name'] for c in d.get('client', [])]
+          if 'com.chronos.app' not in pk:
+              sys.exit("::error::A google-services.json-ban nincs com.chronos.app Android app (van: %s)" % pk)
+          types = [o.get('client_type') for c in d['client'] for o in c.get('oauth_client', [])]
+          if 3 not in types:
+              sys.exit("::error::A google-services.json-ban nincs web OAuth kliens (client_type 3). "
+                       "Firebase: Google provider Enabled + SHA-1 hozzáadva, utána töltsd le újra a fájlt.")
+          print("google-services.json rendben:", pk, types)
+
+          # a google-services Gradle plugin legyen bekötve (a Capacitor sablonban általában megvan)
+          rg = pathlib.Path('android/build.gradle')
+          r = rg.read_text(encoding='utf-8')
+          if 'com.google.gms:google-services' not in r:
+              r = re.sub(r"(classpath ['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"]\n)",
+                         lambda m: m.group(1) + "        classpath 'com.google.gms:google-services:4.4.2'\n",
+                         r, count=1)
+              rg.write_text(r, encoding='utf-8')
+          ag = pathlib.Path('android/app/build.gradle')
+          a = ag.read_text(encoding='utf-8')
+          if 'com.google.gms.google-services' not in a:
+              ag.write_text(a + "\napply plugin: 'com.google.gms.google-services'\n", encoding='utf-8')
+          PY
+
+      - name: Use fixed signing key
+        env:
+          KS: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KS" ]; then
+            echo "::warning::Nincs DEBUG_KEYSTORE_BASE64 secret → ez a build véletlen kulccsal íródik alá: a Google belépés nem fog működni, és az APK nem frissíthető a telepített felett. Futtasd egyszer a workflow-t create_keystore = igen beállítással."
+          else
+            mkdir -p ~/.android
+            echo "$KS" | base64 -d > ~/.android/debug.keystore
+          fi
+
       - name: Build APK
         working-directory: chronos/android
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
+
+      - name: Show signing fingerprints
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          {
+            echo "### APK aláíró ujjlenyomatai (ezeknek szerepelnie kell a Firebase Android appban)"
+            "$BT/apksigner" verify --print-certs chronos/android/app/build/outputs/apk/debug/app-debug.apk | grep -E "SHA-1|SHA-256"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -114,4 +224,3 @@ jobs:
           name: chronos-apk
           path: chronos/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
- 
