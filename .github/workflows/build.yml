@@ -11,6 +11,13 @@ name: Build Chronos APK
 # Miért kell a fix kulcs: a GitHub runner minden buildnél ÚJ debug kulcsot generál →
 # minden APK más SHA-1-gyel készül, így a Google belépés nem működhet, és az APK
 # nem frissíthető a telepített felett. Fix kulccsal mindkettő megoldódik.
+#
+# Google Sign-In (hiba 10 / DEVELOPER_ERROR) checklist:
+#   1. create_keystore egyszer lefutott → debug.keystore.enc a repóban
+#   2. Summary SHA-1 + SHA-256 → Firebase Android app (com.chronos.app) → Add fingerprint
+#   3. Authentication → Google → Enabled
+#   4. Új google-services.json letöltve → GOOGLE_SERVICES_JSON secret frissítve
+#   5. rgcfaIncludeGoogle = true (ez a workflow beállítja)
 
 on:
   push:
@@ -106,7 +113,30 @@ jobs:
           cat "$PJ"
           grep -q FirebaseAuthentication "$PJ" || { echo "::error::A FirebaseAuthentication plugin nem került be (a chronos-capacitor.zip package.json-jában benne van a @capacitor-firebase/authentication?)"; exit 1; }
 
-      - name: Patch build.gradle – add biometric, core & activity dependencies
+      - name: Enable Google provider (rgcfaIncludeGoogle)
+        working-directory: chronos
+        run: |
+          # @capacitor-firebase/authentication Google Sign-In natív függősége
+          # dokumentáció: packages/authentication/docs/setup-google.md
+          VF="android/variables.gradle"
+          if [ ! -f "$VF" ]; then
+            echo "::error::Nincs android/variables.gradle (cap sync után kellene lennie)"
+            exit 1
+          fi
+          if grep -q 'rgcfaIncludeGoogle' "$VF"; then
+            echo "rgcfaIncludeGoogle már be van állítva"
+          else
+            # ext { blokkba beszúrás
+            if grep -q 'ext {' "$VF"; then
+              sed -i '/ext {/a\    rgcfaIncludeGoogle = true\n    androidxCredentialsVersion = "1.3.0"' "$VF"
+            else
+              printf '\next {\n    rgcfaIncludeGoogle = true\n    androidxCredentialsVersion = "1.3.0"\n}\n' >> "$VF"
+            fi
+          fi
+          echo "=== variables.gradle ==="
+          cat "$VF"
+
+      - name: Patch build.gradle – add biometric, core, activity & play-services-auth
         working-directory: chronos
         run: |
           GRADLE="android/app/build.gradle"
@@ -124,34 +154,38 @@ jobs:
           RES_DIR="android/app/src/main/res"
           MANIFEST="android/app/src/main/AndroidManifest.xml"
 
-          # 1. file_paths.xml létrehozása
           mkdir -p "${RES_DIR}/xml"
           cp android-res/xml/file_paths.xml "${RES_DIR}/xml/file_paths.xml"
 
-          # 2. <provider> beillesztése a záró </application> elé
           PROVIDER='    <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true"><meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" /></provider>'
           sed -i "s|</application>|${PROVIDER}\n</application>|" "$MANIFEST"
 
-      - name: Inject custom MainActivity (biometric bridge)
+      - name: Inject custom MainActivity (biometric bridge + OTA)
         working-directory: chronos
         run: |
           DEST="android/app/src/main/java/com/chronos/app/MainActivity.java"
           cp MainActivity.java "$DEST"
 
-      - name: Set version in bootloader
+      - name: Set version in bootloaders
         working-directory: chronos
         run: |
-          # A verziót a chronos_version.txt fájlból olvassa (repóban kell legyen)
-          # Ha nincs ilyen fájl, az aktuális git tag-et használja, különben 1.0.0
           if [ -f "../chronos_version.txt" ]; then
             VERSION=$(cat ../chronos_version.txt | tr -d '[:space:]')
+          elif [ -f "chronos_version.txt" ]; then
+            VERSION=$(cat chronos_version.txt | tr -d '[:space:]')
           elif git describe --tags --exact-match 2>/dev/null; then
             VERSION=$(git describe --tags --exact-match | tr -d 'v')
           else
-            VERSION="1.0.0"
+            VERSION="1.0.1.8"
           fi
           echo "Verzió: $VERSION"
-          sed -i "s|const CURRENT_VERSION = \".*\"|const CURRENT_VERSION = \"$VERSION\"|" www/bootloader.html
+          # bootloader.html + bootloader2.html: APK_VERSION konstans
+          for f in www/bootloader.html www/bootloader2.html; do
+            if [ -f "$f" ]; then
+              sed -i "s|const APK_VERSION *= *['\"][^'\"]*['\"]|const APK_VERSION    = '$VERSION'|" "$f"
+              sed -i "s|var APK_VERSION *= *['\"][^'\"]*['\"]|var APK_VERSION    = '$VERSION'|" "$f"
+            fi
+          done
 
       - name: Patch icons & adaptive icon
         working-directory: chronos
@@ -182,6 +216,8 @@ jobs:
             mkdir -p ~/.android
             openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
               -in debug.keystore.enc -out ~/.android/debug.keystore -pass env:PASSPHRASE
+            echo "Fix debug.keystore betöltve"
+            keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1|SHA256"
           else
             echo "::warning::Nincs fix kulcs (debug.keystore.enc vagy KEYSTORE_PASSPHRASE hiányzik) → ez a build véletlen kulccsal íródik alá: a Google belépés nem fog működni, és az APK nem frissíthető a telepített felett. Futtasd egyszer a workflow-t create_keystore = igen beállítással."
           fi
@@ -219,9 +255,9 @@ jobs:
                   sys.exit("::error::A google-services.json nem tartalmazza az APK kulcsának SHA-1-ét (%s) – "
                            "vedd fel a Firebase Android appban (Add fingerprint), UTÁNA töltsd le újra a fájlt, "
                            "és frissítsd a GOOGLE_SERVICES_JSON secretet." % sha)
-          print("google-services.json rendben:", pk, types)
+          print("google-services.json rendben:", pk, "oauth client_types:", types)
 
-          # a google-services Gradle plugin legyen bekötve (a Capacitor sablonban általában megvan)
+          # google-services Gradle plugin bekötése
           rg = pathlib.Path('android/build.gradle')
           r = rg.read_text(encoding='utf-8')
           if 'com.google.gms:google-services' not in r:
@@ -247,6 +283,12 @@ jobs:
           {
             echo "### APK aláíró ujjlenyomatai (ezeknek szerepelnie kell a Firebase Android appban)"
             "$BT/apksigner" verify --print-certs chronos/android/app/build/outputs/apk/debug/app-debug.apk | grep -E "SHA-1|SHA-256"
+            echo ""
+            echo "### Google Sign-In checklist"
+            echo "1. A fenti SHA-1 + SHA-256 legyen a Firebase Android app (com.chronos.app) fingerprint listájában"
+            echo "2. Authentication → Google → Enabled"
+            echo "3. GOOGLE_SERVICES_JSON secret = SHA hozzáadása UTÁN letöltött google-services.json"
+            echo "4. rgcfaIncludeGoogle = true (ez a build beállította)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK artifact
