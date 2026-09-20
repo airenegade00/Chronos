@@ -174,6 +174,18 @@ jobs:
           cp "${RES_DIR}/mipmap-anydpi-v26/ic_launcher.xml" \
              "${RES_DIR}/mipmap-anydpi-v26/ic_launcher_round.xml"
 
+      - name: Use fixed signing key
+        env:
+          PASSPHRASE: ${{ secrets.KEYSTORE_PASSPHRASE }}
+        run: |
+          if [ -f debug.keystore.enc ] && [ -n "$PASSPHRASE" ]; then
+            mkdir -p ~/.android
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in debug.keystore.enc -out ~/.android/debug.keystore -pass env:PASSPHRASE
+          else
+            echo "::warning::Nincs fix kulcs (debug.keystore.enc vagy KEYSTORE_PASSPHRASE hiányzik) → ez a build véletlen kulccsal íródik alá: a Google belépés nem fog működni, és az APK nem frissíthető a telepített felett. Futtasd egyszer a workflow-t create_keystore = igen beállítással."
+          fi
+
       - name: Add google-services.json (Firebase / Google sign-in)
         working-directory: chronos
         env:
@@ -184,8 +196,13 @@ jobs:
             exit 1
           fi
           printf '%s' "$GSJ" > android/app/google-services.json
+          export APK_SHA1=""
+          if [ -f ~/.android/debug.keystore ] && [ -f ../debug.keystore.enc ]; then
+            APK_SHA1=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep 'SHA1:' | sed 's/.*SHA1: *//' | tr -d ':' | tr 'A-Z' 'a-z')
+            echo "Az APK kulcsának SHA-1-e: $APK_SHA1"
+          fi
           python3 - <<'PY'
-          import json, pathlib, re, sys
+          import json, os, pathlib, re, sys
           d = json.load(open('android/app/google-services.json'))
           pk = [c['client_info']['android_client_info']['package_name'] for c in d.get('client', [])]
           if 'com.chronos.app' not in pk:
@@ -194,6 +211,14 @@ jobs:
           if 3 not in types:
               sys.exit("::error::A google-services.json-ban nincs web OAuth kliens (client_type 3). "
                        "Firebase: Google provider Enabled + SHA-1 hozzáadva, utána töltsd le újra a fájlt.")
+          sha = os.environ.get('APK_SHA1', '').strip()
+          if sha:
+              hashes = [o.get('android_info', {}).get('certificate_hash', '').lower()
+                        for c in d['client'] for o in c.get('oauth_client', [])]
+              if sha not in hashes:
+                  sys.exit("::error::A google-services.json nem tartalmazza az APK kulcsának SHA-1-ét (%s) – "
+                           "vedd fel a Firebase Android appban (Add fingerprint), UTÁNA töltsd le újra a fájlt, "
+                           "és frissítsd a GOOGLE_SERVICES_JSON secretet." % sha)
           print("google-services.json rendben:", pk, types)
 
           # a google-services Gradle plugin legyen bekötve (a Capacitor sablonban általában megvan)
@@ -209,18 +234,6 @@ jobs:
           if 'com.google.gms.google-services' not in a:
               ag.write_text(a + "\napply plugin: 'com.google.gms.google-services'\n", encoding='utf-8')
           PY
-
-      - name: Use fixed signing key
-        env:
-          PASSPHRASE: ${{ secrets.KEYSTORE_PASSPHRASE }}
-        run: |
-          if [ -f debug.keystore.enc ] && [ -n "$PASSPHRASE" ]; then
-            mkdir -p ~/.android
-            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-              -in debug.keystore.enc -out ~/.android/debug.keystore -pass env:PASSPHRASE
-          else
-            echo "::warning::Nincs fix kulcs (debug.keystore.enc vagy KEYSTORE_PASSPHRASE hiányzik) → ez a build véletlen kulccsal íródik alá: a Google belépés nem fog működni, és az APK nem frissíthető a telepített felett. Futtasd egyszer a workflow-t create_keystore = igen beállítással."
-          fi
 
       - name: Build APK
         working-directory: chronos/android
